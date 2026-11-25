@@ -5,6 +5,8 @@ import com.google.gson.JsonParser
 import com.github.agylauncher.AgyBundle
 import com.github.agylauncher.settings.AgySettingsState
 import com.github.agylauncher.statusbar.AgyStatusBarWidget
+import com.intellij.execution.configurations.GeneralCommandLine
+import com.intellij.execution.process.CapturingProcessHandler
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
@@ -47,6 +49,10 @@ class AgyMetricsService(private val project: Project) : Disposable {
     private val tooltipTextRef = AtomicReference(AgyBundle.message("statusbar.metrics.tooltipDefault"))
     private val pollingTaskRef = AtomicReference<ScheduledFuture<*>?>(null)
     private val started = AtomicBoolean(false)
+    /** 标记是否已发起后台拉取 agy 可用第三方模型列表的任务 */
+    private val thirdPartyFetchStarted = AtomicBoolean(false)
+    /** 从 `agy models` 动态解析出的第三方模型族展示名称（如 `CLAUDE&GPT`） */
+    private val thirdPartyModelLabelRef = AtomicReference<String?>(null)
     private val listeners = CopyOnWriteArrayList<() -> Unit>()
 
     private val stateLock = Any()
@@ -66,6 +72,10 @@ class AgyMetricsService(private val project: Project) : Disposable {
     private var weeklyQuotaPercentText: String? = null
     /** 全部配额池悬停展示的 HTML 明细 */
     private var quotaDetailText: String? = null
+    /** 最近一次解析到的原始配额桶列表，用于在第三方模型名异步加载完成后刷新浮窗文案 */
+    private var lastQuotaBuckets: List<QuotaBucketEntry> = emptyList()
+    /** 最近一次解析额度时的活跃模型标识 */
+    private var lastQuotaModelHint: String? = null
     private var isStreaming: Boolean = false
     private var burstTicks: Int = 0
     private var burstStartMs: Long = 0L
@@ -103,6 +113,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
     fun ensureStarted() {
         if (!started.compareAndSet(false, true)) return
         refreshWidgetReferenceAsync()
+        ensureThirdPartyModelsLoadedAsync()
         val future = AppExecutorUtil.getAppScheduledExecutorService().scheduleWithFixedDelay(
             { pollSafely() },
             POLL_INTERVAL_MS,
@@ -183,6 +194,10 @@ class AgyMetricsService(private val project: Project) : Disposable {
             lastTotalApiDurationMs = null
             exactTurnSpeedActive = false
         }
+        if (thirdPartyModelLabelRef.get() == null) {
+            thirdPartyFetchStarted.set(false)
+            ensureThirdPartyModelsLoadedAsync()
+        }
     }
 
     /**
@@ -262,6 +277,73 @@ class AgyMetricsService(private val project: Project) : Disposable {
     }
 
     /**
+     * 在后台线程异步执行 `agy models`，动态提取第三方模型族名称并在完成后刷新浮窗明细。
+     */
+    private fun ensureThirdPartyModelsLoadedAsync() {
+        if (!thirdPartyFetchStarted.compareAndSet(false, true)) return
+        AppExecutorUtil.getAppScheduledExecutorService().execute {
+            if (project.isDisposed) return@execute
+            val dynamicLabel = fetchThirdPartyModelsLabel() ?: return@execute
+            thirdPartyModelLabelRef.set(dynamicLabel)
+            val updatedTooltip: String?
+            synchronized(stateLock) {
+                if (lastQuotaBuckets.isNotEmpty()) {
+                    quotaDetailText = formatAllQuotasHtml(lastQuotaBuckets, lastQuotaModelHint, dynamicLabel)
+                    updatedTooltip = buildTooltipText()
+                } else {
+                    updatedTooltip = null
+                }
+            }
+            if (updatedTooltip != null) {
+                tooltipTextRef.set(updatedTooltip)
+                notifyStatusBarUpdate()
+            }
+        }
+    }
+
+    /**
+     * 返回当前可用的第三方模型展示名；尚未拉取完成或失败时回退为多语言兜底标签（如 `3P` / `第三方`）。
+     */
+    private fun resolveThirdPartyLabel(): String =
+        thirdPartyModelLabelRef.get() ?: AgyBundle.message("statusbar.metrics.thirdPartyFallback")
+
+    /**
+     * 执行 `agy models` 命令并提取所有非 Gemini 模型的厂商家族前缀（如 `CLAUDE&GPT`）。
+     */
+    private fun fetchThirdPartyModelsLabel(): String? {
+        val rawExe = AgySettingsState.getInstance().commandPath.trim().ifEmpty { "agy" }
+        val homeDir = System.getProperty("user.home").orEmpty()
+        val expandedExe = if (rawExe.startsWith("~/") && homeDir.isNotEmpty()) {
+            homeDir + rawExe.substring(1)
+        } else {
+            rawExe
+        }
+        val candidates = mutableListOf(expandedExe)
+        if (expandedExe == "agy" && !SystemInfo.isWindows && homeDir.isNotEmpty()) {
+            val localAgy = File(homeDir, ".local/bin/agy")
+            if (localAgy.isFile && localAgy.canExecute()) {
+                candidates.add(localAgy.absolutePath)
+            }
+        }
+
+        for (exePath in candidates) {
+            val stdout = runCatching {
+                val cmdLine = GeneralCommandLine(exePath, "models")
+                    .withParentEnvironmentType(GeneralCommandLine.ParentEnvironmentType.CONSOLE)
+                project.basePath?.let { cmdLine.withWorkDirectory(it) }
+                val output = CapturingProcessHandler(cmdLine).runProcess(MODELS_FETCH_TIMEOUT_MS)
+                if (output.exitCode == 0) output.stdout else null
+            }.getOrNull() ?: continue
+
+            val parsed = parseThirdPartyModelsLabel(stdout)
+            if (!parsed.isNullOrBlank()) {
+                return parsed
+            }
+        }
+        return null
+    }
+
+    /**
      * 安全执行单次缓冲区轮询，协调上下文解析、弹窗自动关闭、会话恢复同步与速度计算。
      */
     private fun pollSafely() {
@@ -298,6 +380,8 @@ class AgyMetricsService(private val project: Project) : Disposable {
                     weeklyQuotaPercentValue = quota.weeklyPercent
                     weeklyQuotaPercentText = quota.weeklyPercentText
                     quotaDetailText = quota.detailText
+                    lastQuotaBuckets = quota.buckets
+                    lastQuotaModelHint = quota.activeModelHint
                 }
                 applyExactOutputSpeedFromTelemetry(statusLineTelemetry, nowMs)
             }
@@ -669,7 +753,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
         return try {
             val content = Files.readString(path, StandardCharsets.UTF_8)
             if (content.isBlank()) return null
-            val parsed = parseStatusLineJson(content) ?: return null
+            val parsed = parseStatusLineJson(content, resolveThirdPartyLabel()) ?: return null
             lastMetricsFileSignature = signature
             parsed
         } catch (_: Exception) {
@@ -699,14 +783,16 @@ class AgyMetricsService(private val project: Project) : Disposable {
     )
 
     /**
-     * 解析出的额度汇总信息（包含当前模型 5h/周剩余额度主展示及悬停全部配额池明细）。
+     * 解析出的额度汇总信息（包含当前模型 5h/周剩余额度主展示、悬停全部配额池明细及原始桶列表）。
      */
     internal data class QuotaSummary(
         val fiveHourPercent: Double?,
         val fiveHourPercentText: String?,
         val weeklyPercent: Double?,
         val weeklyPercentText: String?,
-        val detailText: String
+        val detailText: String,
+        val buckets: List<QuotaBucketEntry>,
+        val activeModelHint: String?
     )
 
     /**
@@ -735,6 +821,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
         private const val CHARS_PER_TOKEN = 3.6
         private const val CONTEXT_WARN_THRESHOLD = 80.0
         private const val QUOTA_LOW_WARN_THRESHOLD = 20.0
+        private const val MODELS_FETCH_TIMEOUT_MS = 25_000
         private const val DEFAULT_PERCENT_PLACEHOLDER = "--%"
         private const val DEFAULT_SPEED_PLACEHOLDER = "-- tok/s"
 
@@ -801,7 +888,10 @@ class AgyMetricsService(private val project: Project) : Disposable {
         /**
          * 解析 `agy` statusLine 传入的 JSON 数据，提取上下文占比、缓存命中率、真实输出 token 与 API 耗时。
          */
-        internal fun parseStatusLineJson(jsonText: String): StatusLineTelemetry? {
+        internal fun parseStatusLineJson(
+            jsonText: String,
+            thirdPartyLabel: String = AgyBundle.message("statusbar.metrics.thirdPartyFallback")
+        ): StatusLineTelemetry? {
             val root = runCatching { JsonParser.parseString(jsonText).asJsonObject }.getOrNull() ?: return null
             val ctxObj = root.getObjectOrNull("context_window")
             val costObj = root.getObjectOrNull("cost")
@@ -839,7 +929,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
             val modelObj = root.getObjectOrNull("model")
             val activeModelHint = (modelObj?.getStringOrNull("id") ?: modelObj?.getStringOrNull("display_name"))
                 ?.lowercase(Locale.ROOT)
-            val quotaSummary = parseQuotaSummary(root.getObjectOrNull("quota"), activeModelHint)
+            val quotaSummary = parseQuotaSummary(root.getObjectOrNull("quota"), activeModelHint, thirdPartyLabel)
 
             val totalOutputTokens = ctxObj?.getLongOrNull("total_output_tokens")
                 ?: root.getLongOrNull("output_tokens")
@@ -867,9 +957,13 @@ class AgyMetricsService(private val project: Project) : Disposable {
 
         /**
          * 从 `quota` JSON 对象中解析全部配额池剩余比例与刷新倒计时；
-         * 状态栏第二行分别提取当前模型对应的 5h 额度与周额度，悬停提示按有序 HTML 列表展示全部配额池。
+         * 状态栏第二行分别提取当前模型对应的 5h 额度与周额度，悬停提示按有序 HTML 表格展示全部配额池。
          */
-        private fun parseQuotaSummary(quotaObj: JsonObject?, activeModelHint: String?): QuotaSummary? {
+        private fun parseQuotaSummary(
+            quotaObj: JsonObject?,
+            activeModelHint: String?,
+            thirdPartyLabel: String
+        ): QuotaSummary? {
             if (quotaObj == null || quotaObj.size() == 0) return null
 
             val buckets = mutableListOf<QuotaBucketEntry>()
@@ -888,13 +982,15 @@ class AgyMetricsService(private val project: Project) : Disposable {
 
             val fiveHourBucket = selectPrimaryPeriodBucket(buckets, activeModelHint) { isFiveHourBucket(it.name) }
             val weeklyBucket = selectPrimaryPeriodBucket(buckets, activeModelHint) { isWeeklyBucket(it.name) }
-            val detailHtml = formatAllQuotasHtml(buckets, activeModelHint)
+            val detailHtml = formatAllQuotasHtml(buckets, activeModelHint, thirdPartyLabel)
             return QuotaSummary(
                 fiveHourPercent = fiveHourBucket?.remainingPercent,
                 fiveHourPercentText = fiveHourBucket?.let { formatCompactPercent(it.remainingPercent) },
                 weeklyPercent = weeklyBucket?.remainingPercent,
                 weeklyPercentText = weeklyBucket?.let { formatCompactPercent(it.remainingPercent) },
-                detailText = detailHtml
+                detailText = detailHtml,
+                buckets = buckets,
+                activeModelHint = activeModelHint
             )
         }
 
@@ -946,13 +1042,39 @@ class AgyMetricsService(private val project: Project) : Disposable {
         }
 
         /**
-         * 将配额桶原始标识转换为可读展示名称：将 `3p` 替换为 `GPT&CLAUDE`，并将 `gemini` 全大写为 `GEMINI`。
+         * 从 `agy models` 标准输出中提取所有非 Gemini 模型的厂商前缀（如 `CLAUDE&GPT`），避免在代码中写死第三方品牌名。
          */
-        private fun formatQuotaDisplayName(bucketName: String): String {
+        internal fun parseThirdPartyModelsLabel(modelsOutput: String): String? {
+            val families = linkedSetOf<String>()
+            for (rawLine in modelsOutput.lineSequence()) {
+                if (!rawLine.contains('\t')) continue
+                val modelId = rawLine.substringBefore('\t').trim()
+                val displayName = rawLine.substringAfter('\t').trim()
+                if (modelId.isEmpty()) continue
+                val lowerId = modelId.lowercase(Locale.ROOT)
+                val lowerDisplay = displayName.lowercase(Locale.ROOT)
+                if (lowerId.startsWith("gemini") || lowerDisplay.contains("gemini") || lowerId.contains("orchestrator")) {
+                    continue
+                }
+                val familyToken = modelId.substringBefore('-').trim()
+                    .ifEmpty { displayName.substringBefore(' ').trim() }
+                    .uppercase(Locale.ROOT)
+                if (familyToken.isNotEmpty()) {
+                    families.add(familyToken)
+                }
+            }
+            if (families.isEmpty()) return null
+            return families.joinToString("&")
+        }
+
+        /**
+         * 将配额桶原始标识转换为可读展示名称：将 `3p` 替换为动态提取的第三方模型名，并将 `gemini` 全大写为 `GEMINI`。
+         */
+        private fun formatQuotaDisplayName(bucketName: String, thirdPartyLabel: String): String {
             val lower = bucketName.lowercase(Locale.ROOT)
             return when {
-                lower == "3p" -> "GPT&CLAUDE"
-                lower.startsWith("3p-") -> "GPT&CLAUDE-" + bucketName.substring(3)
+                lower == "3p" -> thirdPartyLabel
+                lower.startsWith("3p-") -> "$thirdPartyLabel-" + bucketName.substring(3)
                 lower == "gemini" -> "GEMINI"
                 lower.startsWith("gemini-") -> "GEMINI-" + bucketName.substring(7)
                 else -> bucketName
@@ -962,7 +1084,11 @@ class AgyMetricsService(private val project: Project) : Disposable {
         /**
          * 将全部配额桶按“当前模型优先、5h 周期优先”顺序格式化为对齐的 HTML 表格明细，供鼠标悬停查看。
          */
-        private fun formatAllQuotasHtml(buckets: List<QuotaBucketEntry>, activeModelHint: String?): String {
+        private fun formatAllQuotasHtml(
+            buckets: List<QuotaBucketEntry>,
+            activeModelHint: String?,
+            thirdPartyLabel: String
+        ): String {
             val ordered = buckets.sortedWith(
                 compareBy<QuotaBucketEntry>(
                     { !matchesActiveModel(it.name, activeModelHint) },
@@ -972,7 +1098,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
             )
             val rowsHtml = ordered.joinToString("") { bucket ->
                 val pctText = formatCompactPercent(bucket.remainingPercent)
-                val safeName = StringUtil.escapeXmlEntities(formatQuotaDisplayName(bucket.name))
+                val safeName = StringUtil.escapeXmlEntities(formatQuotaDisplayName(bucket.name, thirdPartyLabel))
                 val safePct = StringUtil.escapeXmlEntities(pctText)
                 val resetCell = if (bucket.resetLabel != null) {
                     val safeReset = StringUtil.escapeXmlEntities(bucket.resetLabel)
@@ -1025,7 +1151,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
         /**
          * 单个配额桶的解析结果。
          */
-        private data class QuotaBucketEntry(
+        internal data class QuotaBucketEntry(
             val name: String,
             val remainingPercent: Double,
             val resetLabel: String?
