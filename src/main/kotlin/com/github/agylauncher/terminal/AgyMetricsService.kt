@@ -11,6 +11,7 @@ import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.SystemInfo
+import com.intellij.openapi.util.text.StringUtil
 import com.intellij.openapi.wm.WindowManager
 import com.intellij.util.concurrency.AppExecutorUtil
 import org.jetbrains.plugins.terminal.ShellTerminalWidget
@@ -18,8 +19,11 @@ import java.io.File
 import java.lang.ref.WeakReference
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
+import java.nio.file.attribute.BasicFileAttributes
 import java.text.DecimalFormat
 import java.text.DecimalFormatSymbols
+import java.time.Duration
+import java.time.Instant
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ScheduledFuture
@@ -38,6 +42,8 @@ class AgyMetricsService(private val project: Project) : Disposable {
 
     private val cachedWidgetRef = AtomicReference<WeakReference<ShellTerminalWidget>?>(null)
     private val displayTextRef = AtomicReference(defaultDisplayText())
+    /** 第二行 5h 剩余额度默认展示文案 */
+    private val quotaTextRef = AtomicReference(defaultQuotaText())
     private val tooltipTextRef = AtomicReference(AgyBundle.message("statusbar.metrics.tooltipDefault"))
     private val pollingTaskRef = AtomicReference<ScheduledFuture<*>?>(null)
     private val started = AtomicBoolean(false)
@@ -50,6 +56,16 @@ class AgyMetricsService(private val project: Project) : Disposable {
     private var contextDetailText: String? = null
     private var cachedPercentText: String? = null
     private var tokPerSecText: String? = null
+    /** 5 小时周期剩余额度百分比数值，用于低额度预警判断 */
+    private var fiveHourQuotaPercentValue: Double? = null
+    /** 5 小时周期剩余额度格式化文案 */
+    private var fiveHourQuotaPercentText: String? = null
+    /** 周周期剩余额度百分比数值，用于低额度预警判断 */
+    private var weeklyQuotaPercentValue: Double? = null
+    /** 周周期剩余额度格式化文案 */
+    private var weeklyQuotaPercentText: String? = null
+    /** 全部配额池悬停展示的 HTML 明细 */
+    private var quotaDetailText: String? = null
     private var isStreaming: Boolean = false
     private var burstTicks: Int = 0
     private var burstStartMs: Long = 0L
@@ -71,7 +87,8 @@ class AgyMetricsService(private val project: Project) : Disposable {
     private var preModalBodyLines: List<String> = emptyList()
     private var lastMainPromptBodyLines: List<String> = emptyList()
     private var hasSeenMainPrompt: Boolean = false
-    private var lastMetricsFileMtime: Long = 0L
+    /** 上次成功解析的 statusLine 文件签名，避免同秒覆写被误判为未变更 */
+    private var lastMetricsFileSignature: MetricsFileSignature? = null
     private var lastTotalOutputTokens: Long? = null
     private var lastTotalApiDurationMs: Long? = null
     private var exactTurnSpeedActive: Boolean = false
@@ -96,12 +113,17 @@ class AgyMetricsService(private val project: Project) : Disposable {
     }
 
     /**
-     * 获取当前应在状态栏展示的文本（例如 `Agy: Ctx 0.0% | -- tok/s`）。
+     * 获取当前应在状态栏第一行展示的上下文、命中缓存与输出速度文本。
      */
     fun getDisplayLabel(): String = displayTextRef.get()
 
     /**
-     * 获取鼠标悬停时的详细指标与操作提示文本。
+     * 获取当前应在状态栏第二行展示的默认 5h 剩余额度文本。
+     */
+    fun getQuotaLabel(): String = quotaTextRef.get()
+
+    /**
+     * 获取鼠标悬停时的详细指标、全部额度及操作提示文本。
      */
     fun getTooltipText(): String = tooltipTextRef.get()
 
@@ -111,7 +133,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
     fun prepareSessionSettingsFile(): String? {
         return try {
             metricsOutputFile.delete()
-            lastMetricsFileMtime = 0L
+            lastMetricsFileSignature = null
 
             val outputPath = metricsOutputFile.absolutePath
             val tmpPath = "$outputPath.tmp"
@@ -155,7 +177,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
             resetPendingBurst()
         }
         metricsOutputFile.delete()
-        lastMetricsFileMtime = 0L
+        lastMetricsFileSignature = null
         synchronized(stateLock) {
             lastTotalOutputTokens = null
             lastTotalApiDurationMs = null
@@ -257,6 +279,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
         var shouldSendEscape = false
         var shouldRefreshContext = false
         val newDisplayText: String
+        val newQuotaText: String
         val newTooltipText: String
 
         synchronized(stateLock) {
@@ -268,6 +291,13 @@ class AgyMetricsService(private val project: Project) : Disposable {
                 }
                 statusLineTelemetry.cacheHitPercentText?.let { cachePct ->
                     cachedPercentText = cachePct
+                }
+                statusLineTelemetry.quotaSummary?.let { quota ->
+                    fiveHourQuotaPercentValue = quota.fiveHourPercent
+                    fiveHourQuotaPercentText = quota.fiveHourPercentText
+                    weeklyQuotaPercentValue = quota.weeklyPercent
+                    weeklyQuotaPercentText = quota.weeklyPercentText
+                    quotaDetailText = quota.detailText
                 }
                 applyExactOutputSpeedFromTelemetry(statusLineTelemetry, nowMs)
             }
@@ -434,6 +464,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
             }
 
             newDisplayText = buildDisplayText()
+            newQuotaText = buildQuotaLineText()
             newTooltipText = buildTooltipText()
         }
 
@@ -450,8 +481,9 @@ class AgyMetricsService(private val project: Project) : Disposable {
         }
 
         val prevDisplay = displayTextRef.getAndSet(newDisplayText)
+        val prevQuota = quotaTextRef.getAndSet(newQuotaText)
         val prevTooltip = tooltipTextRef.getAndSet(newTooltipText)
-        if (prevDisplay != newDisplayText || prevTooltip != newTooltipText) {
+        if (prevDisplay != newDisplayText || prevQuota != newQuotaText || prevTooltip != newTooltipText) {
             notifyStatusBarUpdate()
         }
     }
@@ -560,25 +592,50 @@ class AgyMetricsService(private val project: Project) : Disposable {
     }
 
     /**
-     * 拼装状态栏展示文本，按当前 IDE 语言展示上下文占比（含阈值 ⚠️ 预警）、缓存命中率与输出速度（含流式 ⚡ 标识）。
+     * 拼装状态栏第一行展示文本：按当前 IDE 语言展示上下文占比（含阈值 ⚠️ 预警）、缓存命中率与输出速度（含流式 ⚡ 标识）。
      */
     private fun buildDisplayText(): String {
         val streamPrefix = if (isStreaming) "⚡ " else ""
-        val warnPrefix = if ((contextPercentValue ?: 0.0) >= CONTEXT_WARN_THRESHOLD) "⚠️ " else ""
+        val ctxWarnPrefix = if ((contextPercentValue ?: 0.0) >= CONTEXT_WARN_THRESHOLD) "⚠️ " else ""
         val ctxPart = contextPercentText ?: DEFAULT_PERCENT_PLACEHOLDER
         val cachePart = cachedPercentText ?: DEFAULT_PERCENT_PLACEHOLDER
         val speedPart = tokPerSecText ?: DEFAULT_SPEED_PLACEHOLDER
-        return AgyBundle.message("statusbar.metrics.label", streamPrefix, warnPrefix, ctxPart, cachePart, speedPart)
+        return AgyBundle.message(
+            "statusbar.metrics.label",
+            streamPrefix,
+            ctxWarnPrefix,
+            ctxPart,
+            cachePart,
+            speedPart
+        )
     }
 
     /**
-     * 拼装鼠标悬停提示文本，展示完整 Token 比例、缓存命中率、实时/平均速度及左右键交互说明。
+     * 拼装状态栏第二行展示文本：默认并列展示当前模型对应的 5h 剩余额度与周剩余额度（含低额度预警标识）。
+     */
+    private fun buildQuotaLineText(): String {
+        val fiveHourWarnPrefix = if ((fiveHourQuotaPercentValue ?: 100.0) <= QUOTA_LOW_WARN_THRESHOLD) "⚠️ " else ""
+        val fiveHourPart = fiveHourQuotaPercentText ?: DEFAULT_PERCENT_PLACEHOLDER
+        val weeklyWarnPrefix = if ((weeklyQuotaPercentValue ?: 100.0) <= QUOTA_LOW_WARN_THRESHOLD) "⚠️ " else ""
+        val weeklyPart = weeklyQuotaPercentText ?: DEFAULT_PERCENT_PLACEHOLDER
+        return AgyBundle.message(
+            "statusbar.metrics.quotaLabel",
+            fiveHourWarnPrefix,
+            fiveHourPart,
+            weeklyWarnPrefix,
+            weeklyPart
+        )
+    }
+
+    /**
+     * 拼装鼠标悬停 HTML 提示文本，展示完整 Token 比例、缓存命中率、实时/平均速度、全部配额池明细及左右键交互说明。
      */
     private fun buildTooltipText(): String {
-        val ctxDetail = contextDetailText ?: (contextPercentText ?: DEFAULT_PERCENT_PLACEHOLDER)
-        val cachePart = cachedPercentText ?: DEFAULT_PERCENT_PLACEHOLDER
-        val speedPart = tokPerSecText ?: DEFAULT_SPEED_PLACEHOLDER
-        return AgyBundle.message("statusbar.metrics.tooltipDetail", ctxDetail, cachePart, speedPart)
+        val ctxDetail = StringUtil.escapeXmlEntities(contextDetailText ?: (contextPercentText ?: DEFAULT_PERCENT_PLACEHOLDER))
+        val cachePart = StringUtil.escapeXmlEntities(cachedPercentText ?: DEFAULT_PERCENT_PLACEHOLDER)
+        val speedPart = StringUtil.escapeXmlEntities(tokPerSecText ?: DEFAULT_SPEED_PLACEHOLDER)
+        val quotaHtml = quotaDetailText ?: AgyBundle.message("statusbar.metrics.quotaWaiting")
+        return AgyBundle.message("statusbar.metrics.tooltipDetail", ctxDetail, cachePart, speedPart, quotaHtml)
     }
 
     /**
@@ -595,18 +652,25 @@ class AgyMetricsService(private val project: Project) : Disposable {
     }
 
     /**
-     * 读取 `agy` 通过 statusLine 写入临时文件的最新 JSON 遥测数据，提取上下文占用率与缓存命中率。
+     * 读取 `agy` 通过 statusLine 写入临时文件的最新 JSON 遥测数据；
+     * 使用高精度修改时间、文件长度及 inode 签名判断变更，避免同秒内多次覆写（如启动后异步补齐 quota）被跳过。
      */
     private fun readStatusLineTelemetryIfUpdated(): StatusLineTelemetry? {
         if (!metricsOutputFile.isFile) return null
-        val mtime = metricsOutputFile.lastModified()
-        if (mtime <= 0L || mtime == lastMetricsFileMtime) return null
+        val path = metricsOutputFile.toPath()
+        val signature = try {
+            val attrs = Files.readAttributes(path, BasicFileAttributes::class.java)
+            MetricsFileSignature(attrs.lastModifiedTime().toInstant(), attrs.size(), attrs.fileKey())
+        } catch (_: Exception) {
+            return null
+        }
+        if (signature == lastMetricsFileSignature) return null
 
         return try {
-            val content = Files.readString(metricsOutputFile.toPath(), StandardCharsets.UTF_8)
+            val content = Files.readString(path, StandardCharsets.UTF_8)
             if (content.isBlank()) return null
             val parsed = parseStatusLineJson(content) ?: return null
-            lastMetricsFileMtime = mtime
+            lastMetricsFileSignature = signature
             parsed
         } catch (_: Exception) {
             null
@@ -614,14 +678,35 @@ class AgyMetricsService(private val project: Project) : Disposable {
     }
 
     /**
+     * 遥测文件高精度变更签名，防止同秒写入导致漏读 quota。
+     */
+    private data class MetricsFileSignature(
+        val modifiedAt: Instant,
+        val size: Long,
+        val fileKey: Any?
+    )
+
+    /**
      * 解析后的 `agy` statusLine 结构化遥测指标。
      */
     internal data class StatusLineTelemetry(
         val contextUsage: ContextUsageInfo?,
         val cacheHitPercentText: String?,
+        val quotaSummary: QuotaSummary?,
         val totalOutputTokens: Long?,
         val currentOutputTokens: Long?,
         val totalApiDurationMs: Long?
+    )
+
+    /**
+     * 解析出的额度汇总信息（包含当前模型 5h/周剩余额度主展示及悬停全部配额池明细）。
+     */
+    internal data class QuotaSummary(
+        val fiveHourPercent: Double?,
+        val fiveHourPercentText: String?,
+        val weeklyPercent: Double?,
+        val weeklyPercentText: String?,
+        val detailText: String
     )
 
     /**
@@ -649,11 +734,12 @@ class AgyMetricsService(private val project: Project) : Disposable {
         private const val SUDDEN_HISTORY_JUMP_CHARS = 120
         private const val CHARS_PER_TOKEN = 3.6
         private const val CONTEXT_WARN_THRESHOLD = 80.0
+        private const val QUOTA_LOW_WARN_THRESHOLD = 20.0
         private const val DEFAULT_PERCENT_PLACEHOLDER = "--%"
         private const val DEFAULT_SPEED_PLACEHOLDER = "-- tok/s"
 
         /**
-         * 返回跟随当前 IDE 语言环境的默认状态栏占位文本。
+         * 返回跟随当前 IDE 语言环境的状态栏第一行默认占位文本。
          */
         fun defaultDisplayText(): String = AgyBundle.message(
             "statusbar.metrics.label",
@@ -662,6 +748,17 @@ class AgyMetricsService(private val project: Project) : Disposable {
             DEFAULT_PERCENT_PLACEHOLDER,
             DEFAULT_PERCENT_PLACEHOLDER,
             DEFAULT_SPEED_PLACEHOLDER
+        )
+
+        /**
+         * 返回跟随当前 IDE 语言环境的状态栏第二行 5h 与周额度默认占位文本。
+         */
+        fun defaultQuotaText(): String = AgyBundle.message(
+            "statusbar.metrics.quotaLabel",
+            "",
+            DEFAULT_PERCENT_PLACEHOLDER,
+            "",
+            DEFAULT_PERCENT_PLACEHOLDER
         )
 
         private val CONTEXT_TOKENS_PATTERN = Regex(
@@ -706,8 +803,8 @@ class AgyMetricsService(private val project: Project) : Disposable {
          */
         internal fun parseStatusLineJson(jsonText: String): StatusLineTelemetry? {
             val root = runCatching { JsonParser.parseString(jsonText).asJsonObject }.getOrNull() ?: return null
-            val ctxObj = root.getAsJsonObject("context_window")
-            val costObj = root.getAsJsonObject("cost")
+            val ctxObj = root.getObjectOrNull("context_window")
+            val costObj = root.getObjectOrNull("cost")
 
             val windowSize = ctxObj?.getLongOrNull("context_window_size") ?: 0L
             val usedPctRaw = ctxObj?.getDoubleOrNull("used_percentage")?.coerceIn(0.0, 100.0)
@@ -715,14 +812,14 @@ class AgyMetricsService(private val project: Project) : Disposable {
                 val pctText = formatOneDecimalPercent(pct)
                 val detail = if (windowSize > 0L) {
                     val usedTokens = (windowSize * (pct / 100.0)).roundToLong()
-                    "${formatTokenCount(usedTokens)}/${formatTokenCount(windowSize)} tokens ($pctText)"
+                    "${formatTokenCount(usedTokens)}/${formatTokenCount(windowSize)} ($pctText)"
                 } else {
                     pctText
                 }
                 ContextUsageInfo(pct, pctText, detail)
             }
 
-            val currentUsage = ctxObj?.getAsJsonObject("current_usage")
+            val currentUsage = ctxObj?.getObjectOrNull("current_usage")
             val cacheHitText = currentUsage?.let { usage ->
                 val uncachedInput = usage.getLongOrNull("input_tokens") ?: 0L
                 val cacheCreation = usage.getLongOrNull("cache_creation_input_tokens") ?: 0L
@@ -739,22 +836,223 @@ class AgyMetricsService(private val project: Project) : Disposable {
                 }
             }
 
+            val modelObj = root.getObjectOrNull("model")
+            val activeModelHint = (modelObj?.getStringOrNull("id") ?: modelObj?.getStringOrNull("display_name"))
+                ?.lowercase(Locale.ROOT)
+            val quotaSummary = parseQuotaSummary(root.getObjectOrNull("quota"), activeModelHint)
+
             val totalOutputTokens = ctxObj?.getLongOrNull("total_output_tokens")
                 ?: root.getLongOrNull("output_tokens")
             val currentOutputTokens = currentUsage?.getLongOrNull("output_tokens")
             val totalApiDurationMs = costObj?.getLongOrNull("total_api_duration_ms")
                 ?: root.getLongOrNull("total_api_duration_ms")
 
-            if (contextUsage == null && cacheHitText == null && totalOutputTokens == null && totalApiDurationMs == null) {
+            if (contextUsage == null &&
+                cacheHitText == null &&
+                quotaSummary == null &&
+                totalOutputTokens == null &&
+                totalApiDurationMs == null
+            ) {
                 return null
             }
             return StatusLineTelemetry(
                 contextUsage = contextUsage,
                 cacheHitPercentText = cacheHitText,
+                quotaSummary = quotaSummary,
                 totalOutputTokens = totalOutputTokens,
                 currentOutputTokens = currentOutputTokens,
                 totalApiDurationMs = totalApiDurationMs
             )
+        }
+
+        /**
+         * 从 `quota` JSON 对象中解析全部配额池剩余比例与刷新倒计时；
+         * 状态栏第二行分别提取当前模型对应的 5h 额度与周额度，悬停提示按有序 HTML 列表展示全部配额池。
+         */
+        private fun parseQuotaSummary(quotaObj: JsonObject?, activeModelHint: String?): QuotaSummary? {
+            if (quotaObj == null || quotaObj.size() == 0) return null
+
+            val buckets = mutableListOf<QuotaBucketEntry>()
+            for ((bucketName, element) in quotaObj.entrySet()) {
+                if (!element.isJsonObject) continue
+                val obj = element.asJsonObject
+                if (obj.getBooleanOrNull("disabled") == true) continue
+                val fraction = obj.getDoubleOrNull("remaining_fraction") ?: continue
+                val pct = (fraction * 100.0).coerceIn(0.0, 100.0)
+                val resetSeconds = resolveResetSeconds(obj)
+                val resetLabel = resetSeconds?.let { formatResetCountdown(it) }
+                buckets.add(QuotaBucketEntry(bucketName, pct, resetLabel))
+            }
+
+            if (buckets.isEmpty()) return null
+
+            val fiveHourBucket = selectPrimaryPeriodBucket(buckets, activeModelHint) { isFiveHourBucket(it.name) }
+            val weeklyBucket = selectPrimaryPeriodBucket(buckets, activeModelHint) { isWeeklyBucket(it.name) }
+            val detailHtml = formatAllQuotasHtml(buckets, activeModelHint)
+            return QuotaSummary(
+                fiveHourPercent = fiveHourBucket?.remainingPercent,
+                fiveHourPercentText = fiveHourBucket?.let { formatCompactPercent(it.remainingPercent) },
+                weeklyPercent = weeklyBucket?.remainingPercent,
+                weeklyPercentText = weeklyBucket?.let { formatCompactPercent(it.remainingPercent) },
+                detailText = detailHtml
+            )
+        }
+
+        /**
+         * 按指定周期筛选条件（5h 或周）并结合当前活跃模型族选出对应的主展示配额桶。
+         */
+        private fun selectPrimaryPeriodBucket(
+            buckets: List<QuotaBucketEntry>,
+            activeModelHint: String?,
+            periodPredicate: (QuotaBucketEntry) -> Boolean
+        ): QuotaBucketEntry? {
+            val periodBuckets = buckets.filter(periodPredicate)
+            if (periodBuckets.isEmpty()) return null
+            val modelMatched = periodBuckets.filter { matchesActiveModel(it.name, activeModelHint) }
+            return (modelMatched.ifEmpty { periodBuckets }).minByOrNull { it.remainingPercent }
+        }
+
+        /**
+         * 判断配额桶名称是否属于 5 小时周期配额。
+         */
+        private fun isFiveHourBucket(bucketName: String): Boolean {
+            val lower = bucketName.lowercase(Locale.ROOT)
+            return lower.endsWith("-5h") || lower.contains("5h") || lower.contains("5_hour") || lower.contains("five_hour")
+        }
+
+        /**
+         * 判断配额桶名称是否属于周周期配额。
+         */
+        private fun isWeeklyBucket(bucketName: String): Boolean {
+            val lower = bucketName.lowercase(Locale.ROOT)
+            return lower.endsWith("-weekly") || lower.contains("weekly") || lower.contains("7d") || lower.contains("seven_day")
+        }
+
+        /**
+         * 判断配额桶是否与当前活跃模型族匹配（Gemini 系列匹配 `gemini`，第三方模型匹配 `3p` 或显式前缀）。
+         */
+        private fun matchesActiveModel(bucketName: String, activeModelHint: String?): Boolean {
+            if (activeModelHint.isNullOrBlank()) return false
+            val lowerBucket = bucketName.lowercase(Locale.ROOT)
+            val lowerModel = activeModelHint.lowercase(Locale.ROOT)
+            if (lowerModel.contains("gemini")) {
+                return lowerBucket.contains("gemini")
+            }
+            if (lowerBucket.startsWith("3p")) {
+                return true
+            }
+            val prefix = lowerBucket.substringBefore('-')
+            return prefix.length >= 2 && lowerModel.contains(prefix)
+        }
+
+        /**
+         * 将配额桶原始标识转换为可读展示名称：将 `3p` 替换为 `GPT&CLAUDE`，并将 `gemini` 全大写为 `GEMINI`。
+         */
+        private fun formatQuotaDisplayName(bucketName: String): String {
+            val lower = bucketName.lowercase(Locale.ROOT)
+            return when {
+                lower == "3p" -> "GPT&CLAUDE"
+                lower.startsWith("3p-") -> "GPT&CLAUDE-" + bucketName.substring(3)
+                lower == "gemini" -> "GEMINI"
+                lower.startsWith("gemini-") -> "GEMINI-" + bucketName.substring(7)
+                else -> bucketName
+            }
+        }
+
+        /**
+         * 将全部配额桶按“当前模型优先、5h 周期优先”顺序格式化为对齐的 HTML 表格明细，供鼠标悬停查看。
+         */
+        private fun formatAllQuotasHtml(buckets: List<QuotaBucketEntry>, activeModelHint: String?): String {
+            val ordered = buckets.sortedWith(
+                compareBy<QuotaBucketEntry>(
+                    { !matchesActiveModel(it.name, activeModelHint) },
+                    { !isFiveHourBucket(it.name) },
+                    { it.name.lowercase(Locale.ROOT) }
+                )
+            )
+            val rowsHtml = ordered.joinToString("") { bucket ->
+                val pctText = formatCompactPercent(bucket.remainingPercent)
+                val safeName = StringUtil.escapeXmlEntities(formatQuotaDisplayName(bucket.name))
+                val safePct = StringUtil.escapeXmlEntities(pctText)
+                val resetCell = if (bucket.resetLabel != null) {
+                    val safeReset = StringUtil.escapeXmlEntities(bucket.resetLabel)
+                    "<td nowrap style=\"color: #8C8C8C;\">$safeReset</td>"
+                } else {
+                    "<td></td>"
+                }
+                "<tr>" +
+                    "<td nowrap style=\"padding-right: 12px;\">$safeName</td>" +
+                    "<td nowrap align=\"right\" style=\"padding-right: 10px;\"><b>$safePct</b></td>" +
+                    resetCell +
+                "</tr>"
+            }
+            return "<table cellspacing=\"0\" cellpadding=\"1\">$rowsHtml</table>"
+        }
+
+        /**
+         * 解析配额桶距离下次刷新的剩余秒数（优先读取 `reset_in_seconds`，否则基于 `reset_time` 计算）。
+         */
+        private fun resolveResetSeconds(obj: JsonObject): Long? {
+            val directSeconds = obj.getLongOrNull("reset_in_seconds")
+            if (directSeconds != null) {
+                return maxOf(0L, directSeconds)
+            }
+            val resetIso = obj.getStringOrNull("reset_time") ?: return null
+            return runCatching {
+                val target = Instant.parse(resetIso)
+                maxOf(0L, Duration.between(Instant.now(), target).seconds)
+            }.getOrNull()
+        }
+
+        /**
+         * 将刷新剩余秒数格式化为紧凑的多语言倒计时文案。
+         */
+        private fun formatResetCountdown(seconds: Long): String {
+            if (seconds < 60L) {
+                return AgyBundle.message("statusbar.metrics.resetSoon")
+            }
+            val totalMinutes = seconds / 60L
+            val days = totalMinutes / (24L * 60L)
+            val hours = (totalMinutes % (24L * 60L)) / 60L
+            val minutes = totalMinutes % 60L
+            return when {
+                days > 0L -> AgyBundle.message("statusbar.metrics.resetDayHour", days, hours)
+                hours > 0L -> AgyBundle.message("statusbar.metrics.resetHourMin", hours, minutes)
+                else -> AgyBundle.message("statusbar.metrics.resetMin", minutes)
+            }
+        }
+
+        /**
+         * 单个配额桶的解析结果。
+         */
+        private data class QuotaBucketEntry(
+            val name: String,
+            val remainingPercent: Double,
+            val resetLabel: String?
+        )
+
+        /**
+         * 从 JsonObject 安全读取子对象；当字段缺失或为 JsonNull 时返回 null，避免强转崩溃。
+         */
+        private fun JsonObject.getObjectOrNull(key: String): JsonObject? {
+            val el = get(key) ?: return null
+            return if (el.isJsonObject) el.asJsonObject else null
+        }
+
+        /**
+         * 从 JsonObject 安全读取字符串，字段缺失或非字符串时返回 null。
+         */
+        private fun JsonObject.getStringOrNull(key: String): String? {
+            val el = get(key) ?: return null
+            return if (el.isJsonPrimitive && el.asJsonPrimitive.isString) el.asString else null
+        }
+
+        /**
+         * 从 JsonObject 安全读取布尔值，字段缺失或非布尔值时返回 null。
+         */
+        private fun JsonObject.getBooleanOrNull(key: String): Boolean? {
+            val el = get(key) ?: return null
+            return if (el.isJsonPrimitive && el.asJsonPrimitive.isBoolean) el.asBoolean else null
         }
 
         /**
@@ -896,7 +1194,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
                     val pct = tokenMatch.groupValues[3].toDoubleOrNull()?.coerceIn(0.0, 100.0)
                     if (pct != null) {
                         val pctText = formatOneDecimalPercent(pct)
-                        val detail = "${tokenMatch.groupValues[1]}/${tokenMatch.groupValues[2]} tokens ($pctText)"
+                        val detail = "${tokenMatch.groupValues[1]}/${tokenMatch.groupValues[2]} ($pctText)"
                         return ContextUsageInfo(pct, pctText, detail)
                     }
                 }
