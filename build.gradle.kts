@@ -30,7 +30,7 @@ kotlin {
 
 intellijPlatform {
     pluginConfiguration {
-        id = "com.github.agylauncher"
+        id = "com.github.liliangan.agylauncher"
         name = "Agy Launcher"
         version = "1.0.0"
         description = """
