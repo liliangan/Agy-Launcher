@@ -70,11 +70,6 @@ class AgySettingsConfigurable : BoundConfigurable(AgyBundle.message("configurabl
                 checkBox(AgyBundle.message("settings.monitor.showStatusBarMetrics"))
                     .bindSelected(settings::showStatusBarMetrics)
             }
-            row {
-                checkBox(AgyBundle.message("settings.monitor.autoQueryContextOnIdle"))
-                    .bindSelected(settings::autoQueryContextOnIdle)
-                    .comment(AgyBundle.message("settings.monitor.autoQueryContextOnIdle.comment"))
-            }
         }
     }
 

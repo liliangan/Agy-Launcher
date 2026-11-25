@@ -1,1 +1,1 @@
-rootProject.name = "antigravity-launcher"
+rootProject.name = "agy-launcher"

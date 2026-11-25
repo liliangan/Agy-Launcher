@@ -57,7 +57,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
     private var accumulatedChars: Long = 0L
     private var lastObservedWidget: ShellTerminalWidget? = null
 
-    private var suppressNextAutoContext: Boolean = false
     private var suppressSpeedUntilMs: Long = 0L
     private var awaitingContextDismiss: Boolean = false
     private var contextDismissDeadlineMs: Long = 0L
@@ -170,7 +169,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
     fun triggerContextRefresh(autoDismiss: Boolean = true) {
         val nowMs = System.currentTimeMillis()
         synchronized(stateLock) {
-            suppressNextAutoContext = true
             suppressSpeedUntilMs = maxOf(suppressSpeedUntilMs, nowMs + COMMAND_SPEED_SUPPRESS_MS)
             contextSentAtMs = nowMs
             if (autoDismiss) {
@@ -186,15 +184,14 @@ class AgyMetricsService(private val project: Project) : Disposable {
     }
 
     /**
-     * 向 Antigravity 终端发送 `/compact\r` 触发上下文压缩，并在压缩完成后约 2s 自动刷新一次上下文占用率。
+     * 向 Antigravity 终端发送 `/compact\r` 触发上下文压缩；若未启用 statusLine 遥测，则在压缩结束后兜底刷新一次 `/context`。
      */
     fun triggerCompact() {
         val nowMs = System.currentTimeMillis()
         synchronized(stateLock) {
-            suppressNextAutoContext = true
             suppressSpeedUntilMs = maxOf(suppressSpeedUntilMs, nowMs + COMPACT_SPEED_SUPPRESS_MS)
             awaitingContextDismiss = false
-            compactPendingRefresh = true
+            compactPendingRefresh = !metricsOutputFile.exists()
             compactRefreshTriggerAtMs = nowMs + COMPACT_REFRESH_DELAY_MS
             resetPendingBurst()
         }
@@ -258,7 +255,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
 
         val nowMs = System.currentTimeMillis()
         var shouldSendEscape = false
-        var shouldSendAutoContext = false
         var shouldRefreshContext = false
         val newDisplayText: String
         val newTooltipText: String
@@ -430,13 +426,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
                             tokPerSecText = formatSpeed(avgTokPerSec)
                         }
                         exactTurnSpeedActive = false
-
-                        if (settings.autoQueryContextOnIdle && !suppressNextAutoContext) {
-                            suppressNextAutoContext = true
-                            shouldSendAutoContext = true
-                        } else {
-                            suppressNextAutoContext = false
-                        }
                     }
                     burstTicks = 0
                 }
@@ -456,7 +445,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
             }, ModalityState.any())
         }
 
-        if (shouldRefreshContext || shouldSendAutoContext) {
+        if (shouldRefreshContext) {
             triggerContextRefresh(autoDismiss = true)
         }
 

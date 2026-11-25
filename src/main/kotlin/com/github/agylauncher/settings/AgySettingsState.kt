@@ -41,11 +41,8 @@ class AgySettingsState : PersistentStateComponent<AgySettingsState> {
     /** 未检测到目标终端标签页时是否自动启动 agy */
     var autoStartIfNotRunning: Boolean = true
 
-    /** 是否在底部状态栏展示缓存命中率与输出速度监控 */
+    /** 是否在底部状态栏展示上下文、命中缓存与输出速率监控 */
     var showStatusBarMetrics: Boolean = true
-
-    /** 是否在每轮有效输出结束后自动发送一次 /context 刷新缓存统计 */
-    var autoQueryContextOnIdle: Boolean = false
 
     /**
      * 返回当前需要持久化的配置状态实例。

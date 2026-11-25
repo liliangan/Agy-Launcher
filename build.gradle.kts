@@ -22,7 +22,7 @@ dependencies {
 }
 
 kotlin {
-    jvmToolchain(21)
+    jvmToolchain(25)
     compilerOptions {
         freeCompilerArgs.add("-Xskip-metadata-version-check")
     }
@@ -59,7 +59,7 @@ intellijPlatform {
             url = providers.gradleProperty("pluginVendorUrl")
         }
         ideaVersion {
-            sinceBuild = "243"
+            sinceBuild = "262"
             untilBuild = provider { null }
         }
     }
