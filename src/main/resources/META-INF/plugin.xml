@@ -14,6 +14,11 @@
     <extensions defaultExtensionNs="com.intellij">
         <applicationService serviceImplementation="com.github.agylauncher.settings.AgySettingsState"/>
         <projectService serviceImplementation="com.github.agylauncher.terminal.AgyTerminalService"/>
+        <projectService serviceImplementation="com.github.agylauncher.terminal.AgyMetricsService"/>
+        <statusBarWidgetFactory
+                id="AgyLauncher.StatusBarMetrics"
+                implementation="com.github.agylauncher.statusbar.AgyStatusBarWidgetFactory"
+                order="after Position"/>
         <applicationConfigurable
                 parentId="tools"
                 instance="com.github.agylauncher.settings.AgySettingsConfigurable"

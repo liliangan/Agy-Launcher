@@ -1,15 +1,18 @@
 package com.github.agylauncher.settings
 
 import com.github.agylauncher.AgyBundle
+import com.github.agylauncher.statusbar.AgyStatusBarWidgetFactory
 import com.intellij.openapi.options.BoundConfigurable
+import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.ui.DialogPanel
+import com.intellij.openapi.wm.impl.status.widget.StatusBarWidgetsManager
 import com.intellij.ui.dsl.builder.AlignX
 import com.intellij.ui.dsl.builder.bindSelected
 import com.intellij.ui.dsl.builder.bindText
 import com.intellij.ui.dsl.builder.panel
 
 /**
- * Antigravity Launcher 插件设置面板配置类。
+ * Agy Launcher 插件设置面板配置类。
  */
 class AgySettingsConfigurable : BoundConfigurable(AgyBundle.message("configurable.AgySettings.displayName")) {
 
@@ -59,6 +62,31 @@ class AgySettingsConfigurable : BoundConfigurable(AgyBundle.message("configurabl
             row {
                 checkBox(AgyBundle.message("settings.ref.autoStartIfNotRunning"))
                     .bindSelected(settings::autoStartIfNotRunning)
+            }
+        }
+
+        group(AgyBundle.message("settings.group.statusBarMonitor")) {
+            row {
+                checkBox(AgyBundle.message("settings.monitor.showStatusBarMetrics"))
+                    .bindSelected(settings::showStatusBarMetrics)
+            }
+            row {
+                checkBox(AgyBundle.message("settings.monitor.autoQueryContextOnIdle"))
+                    .bindSelected(settings::autoQueryContextOnIdle)
+                    .comment(AgyBundle.message("settings.monitor.autoQueryContextOnIdle.comment"))
+            }
+        }
+    }
+
+    /**
+     * 保存配置后立即刷新所有打开项目的状态栏监控组件显隐状态。
+     */
+    override fun apply() {
+        super.apply()
+        ProjectManager.getInstance().openProjects.forEach { openProject ->
+            if (!openProject.isDisposed) {
+                openProject.getService(StatusBarWidgetsManager::class.java)
+                    ?.updateWidget(AgyStatusBarWidgetFactory::class.java)
             }
         }
     }
