@@ -16,13 +16,14 @@ repositories {
 
 dependencies {
     intellijPlatform {
-        webstorm("2026.2")
+        webstorm("2024.3")
         bundledPlugin("org.jetbrains.plugins.terminal")
+        javaCompiler("243.21565.193")
     }
 }
 
 kotlin {
-    jvmToolchain(25)
+    jvmToolchain(21)
     compilerOptions {
         freeCompilerArgs.add("-Xskip-metadata-version-check")
     }
@@ -59,7 +60,7 @@ intellijPlatform {
             url = providers.gradleProperty("pluginVendorUrl")
         }
         ideaVersion {
-            sinceBuild = "262"
+            sinceBuild = "243"
             untilBuild = provider { null }
         }
     }
