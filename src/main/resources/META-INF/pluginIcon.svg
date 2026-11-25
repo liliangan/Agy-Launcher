@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 40 40" fill="none">
+  <defs>
+    <linearGradient id="agyBgLight" x1="4" y1="4" x2="36" y2="36" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2563EB"/>
+      <stop offset="100%" stop-color="#4F46E5"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="36" height="36" rx="9" fill="url(#agyBgLight)"/>
+  <path d="M8.5 23.5C7.2 19.6 11.8 15.2 19.8 13.4C27.8 11.6 32.8 13.8 31.5 17.6" stroke="#7DD3FC" stroke-opacity="0.7" stroke-width="1.6" stroke-linecap="round"/>
+  <path d="M20 9.5L29.8 29.5H25.2L20 18.1L14.8 29.5H10.2L20 9.5Z" fill="#FFFFFF"/>
+  <path d="M15.4 25.2C18 23.1 22 23.1 24.6 25.2" stroke="#7DD3FC" stroke-width="2.4" stroke-linecap="round"/>
+  <circle cx="30" cy="10.5" r="2.1" fill="#7DD3FC"/>
+</svg>

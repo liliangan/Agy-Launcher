@@ -1,0 +1,60 @@
+<idea-plugin>
+    <id>com.github.agylauncher</id>
+    <name>Agy Launcher</name>
+    <vendor>Agy Launcher Contributors</vendor>
+    <description><![CDATA[
+        Unofficial launcher for Antigravity CLI (<code>agy</code>). Quickly launch <code>agy</code> inside the built-in Terminal and send file/line/diagnostic references directly from context menus.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>org.jetbrains.plugins.terminal</depends>
+
+    <resource-bundle>messages.AgyBundle</resource-bundle>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationService serviceImplementation="com.github.agylauncher.settings.AgySettingsState"/>
+        <projectService serviceImplementation="com.github.agylauncher.terminal.AgyTerminalService"/>
+        <applicationConfigurable
+                parentId="tools"
+                instance="com.github.agylauncher.settings.AgySettingsConfigurable"
+                id="com.github.agylauncher.settings.AgySettingsConfigurable"
+                key="configurable.AgySettings.displayName"
+                bundle="messages.AgyBundle"/>
+    </extensions>
+
+    <actions>
+        <action id="AgyLauncher.Launch"
+                class="com.github.agylauncher.actions.LaunchAgyAction"
+                icon="com.github.agylauncher.icons.AgyIcons.Agy">
+            <add-to-group group-id="MainToolbarRight" anchor="first"/>
+            <add-to-group group-id="MainToolBar" anchor="last"/>
+            <add-to-group group-id="NavBarToolBar" anchor="last"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="alt shift A"/>
+        </action>
+
+        <action id="AgyLauncher.SendFileReference"
+                class="com.github.agylauncher.actions.SendFileRefToAgyAction"
+                icon="com.github.agylauncher.icons.AgyIcons.Agy">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <add-to-group group-id="EditorTabPopupMenu" anchor="last"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="alt shift S"/>
+        </action>
+
+        <action id="AgyLauncher.SendDiagnostic"
+                class="com.github.agylauncher.actions.SendDiagnosticToAgyAction"
+                icon="com.github.agylauncher.icons.AgyIcons.Agy">
+            <add-to-group group-id="EditorPopupMenu" anchor="after" relative-to-action="AgyLauncher.SendFileReference"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="alt shift D"/>
+        </action>
+
+        <group id="AgyLauncher.ToolsMenu"
+               popup="true"
+               icon="com.github.agylauncher.icons.AgyIcons.Agy">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <reference ref="AgyLauncher.Launch"/>
+            <reference ref="AgyLauncher.SendFileReference"/>
+            <reference ref="AgyLauncher.SendDiagnostic"/>
+        </group>
+    </actions>
+</idea-plugin>
