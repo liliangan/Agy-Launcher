@@ -39,8 +39,8 @@ import kotlin.math.roundToLong
 
 /**
  * Antigravity 终端状态栏指标被动轮询服务。
- * 每 500ms 在后台读取目标终端屏幕缓冲区（最近 30 行历史 + 当前可视屏），
- * 仅从真实的 Context Usage 面板解析上下文占用率，过滤启动横幅、历史回放与 TUI 框线后估算输出速度。
+ * 每 500ms 在后台读取 `agy` statusLine 遥测与目标终端屏幕缓冲区（最近 30 行历史 + 当前可视屏），
+ * 同步更新上下文占用率、命中缓存率与 5h/周剩余额度。
  */
 @Service(Service.Level.PROJECT)
 class AgyMetricsService(private val project: Project) : Disposable {
@@ -68,7 +68,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
     private var contextPercentText: String? = null
     private var contextDetailText: String? = null
     private var cachedPercentText: String? = null
-    private var tokPerSecText: String? = null
     /** 5 小时周期剩余额度百分比数值，用于低额度预警判断 */
     private var fiveHourQuotaPercentValue: Double? = null
     /** 5 小时周期剩余额度格式化文案 */
@@ -83,14 +82,8 @@ class AgyMetricsService(private val project: Project) : Disposable {
     private var lastQuotaBuckets: List<QuotaBucketEntry> = emptyList()
     /** 最近一次解析额度时的活跃模型标识 */
     private var lastQuotaModelHint: String? = null
-    private var isStreaming: Boolean = false
-    private var burstTicks: Int = 0
-    private var burstStartMs: Long = 0L
-    private var lastActiveMs: Long = 0L
-    private var accumulatedChars: Long = 0L
     private var lastObservedWidget: ShellTerminalWidget? = null
 
-    private var suppressSpeedUntilMs: Long = 0L
     private var awaitingContextDismiss: Boolean = false
     private var contextDismissDeadlineMs: Long = 0L
     private var contextSentAtMs: Long = 0L
@@ -106,9 +99,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
     private var hasSeenMainPrompt: Boolean = false
     /** 上次成功解析的 statusLine 文件签名，避免同秒覆写被误判为未变更 */
     private var lastMetricsFileSignature: MetricsFileSignature? = null
-    private var lastTotalOutputTokens: Long? = null
-    private var lastTotalApiDurationMs: Long? = null
-    private var exactTurnSpeedActive: Boolean = false
 
     private val sessionKey: String = Integer.toHexString((project.basePath ?: project.name).hashCode())
     private val metricsOutputFile: File = File(System.getProperty("java.io.tmpdir"), "agy-launcher-metrics-$sessionKey.json")
@@ -155,7 +145,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
     }
 
     /**
-     * 获取当前应在状态栏第一行展示的上下文、命中缓存与输出速度文本。
+     * 获取当前应在状态栏第一行展示的上下文与命中缓存文本。
      */
     fun getDisplayLabel(): String = displayTextRef.get()
 
@@ -207,24 +197,16 @@ class AgyMetricsService(private val project: Project) : Disposable {
     }
 
     /**
-     * 在新建终端并启动 CLI 时进入启动静默窗口，避免将启动横幅与初始化文本误计为输出速度。
+     * 在新建终端并启动 CLI 时重置旧上下文指标及状态，确保新会话从干净基线开始监测。
      */
     fun suppressStartupWindow() {
-        val nowMs = System.currentTimeMillis()
         synchronized(stateLock) {
-            suppressSpeedUntilMs = maxOf(suppressSpeedUntilMs, nowMs + STARTUP_SPEED_SUPPRESS_MS)
             sawExternalModal = false
             pendingResumeRefresh = false
             clearContextMetrics()
-            resetPendingBurst()
         }
         metricsOutputFile.delete()
         lastMetricsFileSignature = null
-        synchronized(stateLock) {
-            lastTotalOutputTokens = null
-            lastTotalApiDurationMs = null
-            exactTurnSpeedActive = false
-        }
         if (thirdPartyModelLabelRef.get() == null) {
             thirdPartyFetchStarted.set(false)
             ensureThirdPartyModelsLoadedAsync()
@@ -237,7 +219,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
     fun triggerContextRefresh(autoDismiss: Boolean = true) {
         val nowMs = System.currentTimeMillis()
         synchronized(stateLock) {
-            suppressSpeedUntilMs = maxOf(suppressSpeedUntilMs, nowMs + COMMAND_SPEED_SUPPRESS_MS)
             contextSentAtMs = nowMs
             if (autoDismiss) {
                 awaitingContextDismiss = true
@@ -257,11 +238,9 @@ class AgyMetricsService(private val project: Project) : Disposable {
     fun triggerCompact() {
         val nowMs = System.currentTimeMillis()
         synchronized(stateLock) {
-            suppressSpeedUntilMs = maxOf(suppressSpeedUntilMs, nowMs + COMPACT_SPEED_SUPPRESS_MS)
             awaitingContextDismiss = false
             compactPendingRefresh = !metricsOutputFile.exists()
             compactRefreshTriggerAtMs = nowMs + COMPACT_REFRESH_DELAY_MS
-            resetPendingBurst()
         }
         ApplicationManager.getApplication().invokeLater({
             if (!project.isDisposed) {
@@ -324,7 +303,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
     private fun resetSessionMetrics() {
         synchronized(stateLock) {
             clearContextMetrics()
-            tokPerSecText = null
             fiveHourQuotaPercentValue = null
             fiveHourQuotaPercentText = null
             weeklyQuotaPercentValue = null
@@ -347,13 +325,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
             preModalBodyLines = emptyList()
             lastMainPromptBodyLines = emptyList()
             hasSeenMainPrompt = false
-            lastActiveMs = 0L
-            burstStartMs = 0L
-            suppressSpeedUntilMs = 0L
             lastMetricsFileSignature = null
-            lastTotalOutputTokens = null
-            lastTotalApiDurationMs = null
-            resetPendingBurst()
         }
         displayTextRef.set(defaultDisplayText())
         quotaTextRef.set(defaultQuotaText())
@@ -454,7 +426,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
     }
 
     /**
-     * 安全执行单次缓冲区轮询，协调上下文解析、弹窗自动关闭、会话恢复同步与速度计算。
+     * 安全执行单次缓冲区与遥测轮询，协调上下文解析、弹窗自动关闭及会话恢复同步。
      */
     private fun pollSafely() {
         if (project.isDisposed) return
@@ -493,13 +465,11 @@ class AgyMetricsService(private val project: Project) : Disposable {
                     lastQuotaBuckets = quota.buckets
                     lastQuotaModelHint = quota.activeModelHint
                 }
-                applyExactOutputSpeedFromTelemetry(statusLineTelemetry, nowMs)
             }
 
             val isNewWidget = widget != null && lastObservedWidget !== widget
             if (isNewWidget) {
                 lastObservedWidget = widget
-                suppressSpeedUntilMs = maxOf(suppressSpeedUntilMs, nowMs + STARTUP_SPEED_SUPPRESS_MS)
                 lastResumeMarkerHash = 0
                 sawExternalModal = false
                 wasUsingAltBuffer = false
@@ -507,7 +477,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
                 lastMainPromptBodyLines = emptyList()
                 preModalBodyLines = emptyList()
                 pendingResumeRefresh = false
-                resetPendingBurst()
             }
 
             val usingAltBuffer = widget?.let { isAlternateBufferActive(it) } ?: false
@@ -533,14 +502,12 @@ class AgyMetricsService(private val project: Project) : Disposable {
                     awaitingContextDismiss = false
                 } else if (nowMs > contextSentAtMs && hasContextPanel && parsedContext != null) {
                     awaitingContextDismiss = false
-                    suppressSpeedUntilMs = maxOf(suppressSpeedUntilMs, nowMs + DISMISS_SPEED_SUPPRESS_MS)
                     shouldSendEscape = true
                 }
             }
 
             val prev = previousLines
             val deltaChars = if (prev != null && !isNewWidget) computeAddedVisibleChars(prev, lines) else 0
-            val addedLinesHasUiBanner = prev != null && hasNonStreamUiBannerInDelta(prev, lines)
             previousLines = lines
 
             val currentBodyLines = extractConversationBody(lines)
@@ -551,7 +518,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
                     sawExternalModal = true
                     preModalBodyLines = lastMainPromptBodyLines
                 }
-                suppressSpeedUntilMs = maxOf(suppressSpeedUntilMs, nowMs + COMMAND_SPEED_SUPPRESS_MS)
             }
             wasUsingAltBuffer = usingAltBuffer
 
@@ -559,7 +525,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
             val resumeMarkerTriggered = resumeSignature != 0 && resumeSignature != lastResumeMarkerHash
             val suddenHistoryJump = !isNewWidget &&
                 hasSeenMainPrompt &&
-                !isStreaming &&
                 !awaitingContextDismiss &&
                 atMainPrompt &&
                 deltaChars >= SUDDEN_HISTORY_JUMP_CHARS
@@ -572,7 +537,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
                 hasSeenMainPrompt &&
                 atMainPrompt &&
                 !awaitingContextDismiss &&
-                !isStreaming &&
                 hasBodyReplaced(lastMainPromptBodyLines, currentBodyLines)
 
             // 仅当尚未拿到 statusLine 结构化遥测且检测到 /resume 等会话切换时，才触发一次 /context 兜底
@@ -586,8 +550,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
                     resumeStableSinceMs = nowMs
                     clearContextMetrics()
                 }
-                suppressSpeedUntilMs = maxOf(suppressSpeedUntilMs, nowMs + COMPACT_SPEED_SUPPRESS_MS)
-                resetPendingBurst()
             } else if (sawExternalModal && atMainPrompt) {
                 sawExternalModal = false
             }
@@ -608,13 +570,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
                 }
             }
 
-            val skipSpeedForUi = isNewWidget ||
-                hasContextPanel ||
-                hasOtherModal ||
-                addedLinesHasUiBanner ||
-                pendingResumeRefresh ||
-                nowMs <= suppressSpeedUntilMs
-
             if (compactPendingRefresh) {
                 if (deltaChars >= MIN_DELTA_CHARS && !hasContextPanel) {
                     compactRefreshTriggerAtMs = maxOf(compactRefreshTriggerAtMs, nowMs + COMPACT_REFRESH_DELAY_MS)
@@ -622,39 +577,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
                     compactPendingRefresh = false
                     shouldRefreshContext = true
                 }
-            } else if (!skipSpeedForUi) {
-                if (deltaChars >= MIN_DELTA_CHARS) {
-                    if (burstTicks == 0) {
-                        burstStartMs = nowMs - POLL_INTERVAL_MS
-                        accumulatedChars = 0L
-                    }
-                    burstTicks++
-                    accumulatedChars += deltaChars
-                    lastActiveMs = nowMs
-
-                    // 至少连续 3 个有效增量周期（>= 1.5s）才确认为真正的流式输出，过滤启动横幅与历史回放
-                    if (burstTicks >= MIN_BURST_TICKS) {
-                        isStreaming = true
-                        if (!exactTurnSpeedActive) {
-                            val elapsedSec = maxOf(0.5, (nowMs - burstStartMs) / 1000.0)
-                            val tokPerSec = (accumulatedChars / CHARS_PER_TOKEN) / elapsedSec
-                            tokPerSecText = formatSpeed(tokPerSec)
-                        }
-                    }
-                } else if (nowMs - lastActiveMs >= IDLE_TIMEOUT_MS) {
-                    if (isStreaming) {
-                        isStreaming = false
-                        if (!exactTurnSpeedActive) {
-                            val activeSec = maxOf(0.5, (lastActiveMs - burstStartMs) / 1000.0)
-                            val avgTokPerSec = (accumulatedChars / CHARS_PER_TOKEN) / activeSec
-                            tokPerSecText = formatSpeed(avgTokPerSec)
-                        }
-                        exactTurnSpeedActive = false
-                    }
-                    burstTicks = 0
-                }
-            } else if (isStreaming || burstTicks > 0) {
-                resetPendingBurst()
             }
 
             newDisplayText = buildDisplayText()
@@ -679,64 +601,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
         val prevTooltip = tooltipTextRef.getAndSet(newTooltipText)
         if (prevDisplay != newDisplayText || prevQuota != newQuotaText || prevTooltip != newTooltipText) {
             notifyStatusBarUpdate()
-        }
-    }
-
-    /**
-     * 清理尚未结束或被 UI 弹层/启动横幅打断的临时采样周期。
-     */
-    private fun resetPendingBurst() {
-        isStreaming = false
-        burstTicks = 0
-        accumulatedChars = 0L
-        exactTurnSpeedActive = false
-    }
-
-    /**
-     * 基于 `agy` statusLine 提供的真实 output_tokens 与 total_api_duration_ms 计算精确输出速度；
-     * 若账号/版本未提供 total_api_duration_ms，则在检测到真实流式回合结束时用真实 output_tokens 校准平均速度。
-     */
-    private fun applyExactOutputSpeedFromTelemetry(telemetry: StatusLineTelemetry, nowMs: Long) {
-        val totalOut = telemetry.totalOutputTokens
-        val totalApiMs = telemetry.totalApiDurationMs
-        val prevOut = lastTotalOutputTokens
-        val prevApiMs = lastTotalApiDurationMs
-
-        if (totalOut != null) {
-            lastTotalOutputTokens = totalOut
-        }
-        if (totalApiMs != null) {
-            lastTotalApiDurationMs = totalApiMs
-        }
-
-        // 首次拿到遥测或发生 /resume 会话跳变（累计值大幅突变且远超单轮 output_tokens）时只建立基线
-        if (prevOut == null || totalOut == null || totalOut < prevOut) {
-            return
-        }
-
-        val deltaOut = totalOut - prevOut
-        val singleTurnOut = telemetry.currentOutputTokens
-        val looksLikeSessionResumeJump = singleTurnOut != null && deltaOut > singleTurnOut * 2 + 500
-        if (looksLikeSessionResumeJump) {
-            return
-        }
-
-        // 1. 优先使用真实的 API 增量耗时与增量 output_tokens
-        if (totalApiMs != null && prevApiMs != null && totalApiMs > prevApiMs && deltaOut > 0L) {
-            val deltaApiSec = (totalApiMs - prevApiMs) / 1000.0
-            if (deltaApiSec >= 0.05) {
-                tokPerSecText = formatSpeed(deltaOut / deltaApiSec)
-                exactTurnSpeedActive = true
-                return
-            }
-        }
-
-        // 2. 若无 total_api_duration_ms，则用真实单轮 output_tokens 结合实测流式耗时校准
-        val turnTokens = if (deltaOut > 0L) deltaOut else (singleTurnOut ?: 0L)
-        if (turnTokens > 0L && (isStreaming || burstTicks > 0) && nowMs > burstStartMs) {
-            val activeSec = maxOf(0.5, (nowMs - burstStartMs) / 1000.0)
-            tokPerSecText = formatSpeed(turnTokens / activeSec)
-            exactTurnSpeedActive = true
         }
     }
 
@@ -786,21 +650,17 @@ class AgyMetricsService(private val project: Project) : Disposable {
     }
 
     /**
-     * 拼装状态栏第一行展示文本：按当前 IDE 语言展示上下文占比（含阈值 ⚠️ 预警）、缓存命中率与输出速度（含流式 ⚡ 标识）。
+     * 拼装状态栏第一行展示文本：按当前 IDE 语言展示上下文占比（含阈值 ⚠️ 预警）与缓存命中率。
      */
     private fun buildDisplayText(): String {
-        val streamPrefix = if (isStreaming) "⚡ " else ""
         val ctxWarnPrefix = if ((contextPercentValue ?: 0.0) >= CONTEXT_WARN_THRESHOLD) "⚠️ " else ""
         val ctxPart = contextPercentText ?: DEFAULT_PERCENT_PLACEHOLDER
         val cachePart = cachedPercentText ?: DEFAULT_PERCENT_PLACEHOLDER
-        val speedPart = tokPerSecText ?: DEFAULT_SPEED_PLACEHOLDER
         return AgyBundle.message(
             "statusbar.metrics.label",
-            streamPrefix,
             ctxWarnPrefix,
             ctxPart,
-            cachePart,
-            speedPart
+            cachePart
         )
     }
 
@@ -822,14 +682,13 @@ class AgyMetricsService(private val project: Project) : Disposable {
     }
 
     /**
-     * 拼装鼠标悬停 HTML 提示文本，展示完整 Token 比例、缓存命中率、实时/平均速度、全部配额池明细及左右键交互说明。
+     * 拼装鼠标悬停 HTML 提示文本，展示完整 Token 比例、缓存命中率、全部配额池明细及左右键交互说明。
      */
     private fun buildTooltipText(): String {
         val ctxDetail = StringUtil.escapeXmlEntities(contextDetailText ?: (contextPercentText ?: DEFAULT_PERCENT_PLACEHOLDER))
         val cachePart = StringUtil.escapeXmlEntities(cachedPercentText ?: DEFAULT_PERCENT_PLACEHOLDER)
-        val speedPart = StringUtil.escapeXmlEntities(tokPerSecText ?: DEFAULT_SPEED_PLACEHOLDER)
         val quotaHtml = quotaDetailText ?: AgyBundle.message("statusbar.metrics.quotaWaiting")
-        return AgyBundle.message("statusbar.metrics.tooltipDetail", ctxDetail, cachePart, speedPart, quotaHtml)
+        return AgyBundle.message("statusbar.metrics.tooltipDetail", ctxDetail, cachePart, quotaHtml)
     }
 
     /**
@@ -886,10 +745,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
     internal data class StatusLineTelemetry(
         val contextUsage: ContextUsageInfo?,
         val cacheHitPercentText: String?,
-        val quotaSummary: QuotaSummary?,
-        val totalOutputTokens: Long?,
-        val currentOutputTokens: Long?,
-        val totalApiDurationMs: Long?
+        val quotaSummary: QuotaSummary?
     )
 
     /**
@@ -916,24 +772,16 @@ class AgyMetricsService(private val project: Project) : Disposable {
 
     companion object {
         private const val POLL_INTERVAL_MS = 500L
-        private const val IDLE_TIMEOUT_MS = 1500L
-        private const val STARTUP_SPEED_SUPPRESS_MS = 5000L
         private const val CONTEXT_DISMISS_TIMEOUT_MS = 2500L
-        private const val COMMAND_SPEED_SUPPRESS_MS = 2000L
-        private const val DISMISS_SPEED_SUPPRESS_MS = 1000L
-        private const val COMPACT_SPEED_SUPPRESS_MS = 3500L
         private const val COMPACT_REFRESH_DELAY_MS = 2000L
         private const val RESUME_REFRESH_DELAY_MS = 500L
         private const val HISTORY_LINES_TO_READ = 30
         private const val MIN_DELTA_CHARS = 4
-        private const val MIN_BURST_TICKS = 3
         private const val SUDDEN_HISTORY_JUMP_CHARS = 120
-        private const val CHARS_PER_TOKEN = 3.6
         private const val CONTEXT_WARN_THRESHOLD = 80.0
         private const val QUOTA_LOW_WARN_THRESHOLD = 20.0
         private const val MODELS_FETCH_TIMEOUT_MS = 25_000
         private const val DEFAULT_PERCENT_PLACEHOLDER = "--%"
-        private const val DEFAULT_SPEED_PLACEHOLDER = "-- tok/s"
 
         /**
          * 返回跟随当前 IDE 语言环境的状态栏第一行默认占位文本。
@@ -941,10 +789,8 @@ class AgyMetricsService(private val project: Project) : Disposable {
         fun defaultDisplayText(): String = AgyBundle.message(
             "statusbar.metrics.label",
             "",
-            "",
             DEFAULT_PERCENT_PLACEHOLDER,
-            DEFAULT_PERCENT_PLACEHOLDER,
-            DEFAULT_SPEED_PLACEHOLDER
+            DEFAULT_PERCENT_PLACEHOLDER
         )
 
         /**
@@ -996,7 +842,7 @@ class AgyMetricsService(private val project: Project) : Disposable {
             project.getService(AgyMetricsService::class.java)
 
         /**
-         * 解析 `agy` statusLine 传入的 JSON 数据，提取上下文占比、缓存命中率、真实输出 token 与 API 耗时。
+         * 解析 `agy` statusLine 传入的 JSON 数据，提取上下文占比、缓存命中率与配额汇总。
          */
         internal fun parseStatusLineJson(
             jsonText: String,
@@ -1004,7 +850,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
         ): StatusLineTelemetry? {
             val root = runCatching { JsonParser.parseString(jsonText).asJsonObject }.getOrNull() ?: return null
             val ctxObj = root.getObjectOrNull("context_window")
-            val costObj = root.getObjectOrNull("cost")
 
             val windowSize = ctxObj?.getLongOrNull("context_window_size") ?: 0L
             val usedPctRaw = ctxObj?.getDoubleOrNull("used_percentage")?.coerceIn(0.0, 100.0)
@@ -1041,27 +886,16 @@ class AgyMetricsService(private val project: Project) : Disposable {
                 ?.lowercase(Locale.ROOT)
             val quotaSummary = parseQuotaSummary(root.getObjectOrNull("quota"), activeModelHint, thirdPartyLabel)
 
-            val totalOutputTokens = ctxObj?.getLongOrNull("total_output_tokens")
-                ?: root.getLongOrNull("output_tokens")
-            val currentOutputTokens = currentUsage?.getLongOrNull("output_tokens")
-            val totalApiDurationMs = costObj?.getLongOrNull("total_api_duration_ms")
-                ?: root.getLongOrNull("total_api_duration_ms")
-
             if (contextUsage == null &&
                 cacheHitText == null &&
-                quotaSummary == null &&
-                totalOutputTokens == null &&
-                totalApiDurationMs == null
+                quotaSummary == null
             ) {
                 return null
             }
             return StatusLineTelemetry(
                 contextUsage = contextUsage,
                 cacheHitPercentText = cacheHitText,
-                quotaSummary = quotaSummary,
-                totalOutputTokens = totalOutputTokens,
-                currentOutputTokens = currentOutputTokens,
-                totalApiDurationMs = totalApiDurationMs
+                quotaSummary = quotaSummary
             )
         }
 
@@ -1394,16 +1228,6 @@ class AgyMetricsService(private val project: Project) : Disposable {
         }
 
         /**
-         * 检查本次刷新新增或变化的行中是否包含 CLI 横幅/系统提示等非正文 UI。
-         */
-        internal fun hasNonStreamUiBannerInDelta(prevLines: List<String>, currLines: List<String>): Boolean {
-            val prevSet = prevLines.toHashSet()
-            return currLines.any { line ->
-                !prevSet.contains(line) && NON_STREAM_UI_MARKERS.any { marker -> line.contains(marker) }
-            }
-        }
-
-        /**
          * 提取用于识别会话恢复（/resume 或多实例冲突提示）的特征签名。
          */
         private fun computeResumeSignature(lines: List<String>): Int {
@@ -1599,11 +1423,5 @@ class AgyMetricsService(private val project: Project) : Disposable {
             val df = DecimalFormat("0.#", DecimalFormatSymbols(Locale.US))
             return "${df.format(value)}%"
         }
-
-        /**
-         * 格式化 tok/s 输出速度，保留一位小数。
-         */
-        private fun formatSpeed(tokPerSec: Double): String =
-            String.format(Locale.US, "%.1f tok/s", tokPerSec)
     }
 }

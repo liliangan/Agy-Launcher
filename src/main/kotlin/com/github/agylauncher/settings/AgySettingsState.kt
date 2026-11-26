@@ -41,7 +41,7 @@ class AgySettingsState : PersistentStateComponent<AgySettingsState> {
     /** 未检测到目标终端标签页时是否自动启动 agy */
     var autoStartIfNotRunning: Boolean = true
 
-    /** 是否在底部状态栏展示上下文、命中缓存与输出速率监控 */
+    /** 是否在底部状态栏展示上下文、命中缓存与额度监控 */
     var showStatusBarMetrics: Boolean = true
 
     /**

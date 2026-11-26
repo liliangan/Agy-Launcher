@@ -11,7 +11,7 @@ import com.intellij.openapi.wm.StatusBarWidgetFactory
 
 /**
  * 底部状态栏监控控件工厂。
- * 在状态栏右侧注册并管理 Agy 缓存命中率与输出速度展示组件。
+ * 在状态栏右侧注册并管理 Agy 上下文、缓存命中率与额度展示组件。
  */
 class AgyStatusBarWidgetFactory : StatusBarWidgetFactory {
 

@@ -24,7 +24,7 @@ import javax.swing.SwingUtilities
 
 /**
  * 底部状态栏自定义监控控件。
- * 第一行展示上下文占用率、命中缓存与输出速度；第二行独立展示 5h 与周剩余额度；
+ * 第一行展示上下文占用率与命中缓存；第二行独立展示 5h 与周剩余额度；
  * 悬停展示全部配额池明细与刷新倒计时，支持左键 `/context` 刷新与右键 `/compact` 压缩菜单。
  */
 class AgyStatusBarWidget(private val project: Project) : CustomStatusBarWidget {
@@ -44,7 +44,7 @@ class AgyStatusBarWidget(private val project: Project) : CustomStatusBarWidget {
         }
     }
 
-    /** 第一行状态标签：上下文、缓存命中率与输出速度 */
+    /** 第一行状态标签：上下文与缓存命中率 */
     private val metricsLabel: JBLabel = createHoverableLabel(AgyMetricsService.defaultDisplayText())
 
     /** 第二行状态标签：独立显示的 5h 与周剩余额度 */
