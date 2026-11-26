@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.github.agylauncher"
-version = "1.0.0"
+version = "1.0.1"
 
 repositories {
     mavenCentral()
@@ -33,7 +33,7 @@ intellijPlatform {
     pluginConfiguration {
         id = "com.github.liliangan.agylauncher"
         name = "Agy Launcher"
-        version = "1.0.0"
+        version = "1.0.1"
         description = """
             <p><strong>Unofficial launcher for Antigravity CLI (<code>agy</code>).</strong> Launch <code>agy</code> inside JetBrains IDE's built-in Terminal and send file, line-range, or diagnostic references directly from context menus. Supports English and Simplified Chinese (<code>zh_CN</code>).</p>
             <h3>Features</h3>
@@ -75,6 +75,11 @@ intellijPlatform {
             <p>All shortcuts can be customized in <em>Settings &rarr; Keymap &rarr; Plugins &rarr; Agy Launcher</em>.</p>
         """.trimIndent()
         changeNotes = """
+            <h3>1.0.1</h3>
+            <ul>
+              <li>Show the status bar metrics widget only after launching Antigravity via the plugin, and automatically hide it &amp; stop polling when the terminal tab is closed.</li>
+              <li>Fixed Orchestrator mode quota matching so the status bar displays Gemini 5h and weekly remaining quotas instead of falling back to third-party (<code>3p</code>) buckets.</li>
+            </ul>
             <h3>1.0.0</h3>
             <ul>
               <li>Initial release: launch/focus Antigravity CLI in built-in Terminal, send file/line references, send editor diagnostics/errors, and monitor context usage, cache hit rate, output speed &amp; remaining quota in the status bar.</li>

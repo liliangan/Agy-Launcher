@@ -34,6 +34,10 @@ class AgyTerminalService(private val project: Project) {
 
         val existingContent = findAgyContent(manager, settings.terminalTabTitle)
         if (existingContent != null) {
+            val existingWidget = TerminalToolWindowManager.getWidgetByContent(existingContent) as? ShellTerminalWidget
+            if (existingWidget != null) {
+                AgyMetricsService.getInstance(project).activateSession(existingWidget)
+            }
             toolWindow?.activate {
                 manager.toolWindow?.contentManager?.setSelectedContent(existingContent, true)
             }
@@ -45,6 +49,7 @@ class AgyTerminalService(private val project: Project) {
         metricsService.suppressStartupWindow()
         val widget = manager.createLocalShellWidget(workingDir, settings.terminalTabTitle)
         trackedWidgetRef = WeakReference(widget)
+        metricsService.activateSession(widget)
         val fullCommand = buildLaunchCommand(settings, metricsService)
 
         try {
@@ -83,6 +88,7 @@ class AgyTerminalService(private val project: Project) {
         metricsService.suppressStartupWindow()
         val widget = manager.createLocalShellWidget(workingDir, settings.terminalTabTitle)
         trackedWidgetRef = WeakReference(widget)
+        metricsService.activateSession(widget)
         val fullCommand = buildLaunchCommand(settings, metricsService)
 
         try {

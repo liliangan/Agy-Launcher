@@ -2,6 +2,7 @@ package com.github.agylauncher.statusbar
 
 import com.github.agylauncher.AgyBundle
 import com.github.agylauncher.settings.AgySettingsState
+import com.github.agylauncher.terminal.AgyMetricsService
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.wm.StatusBar
@@ -25,10 +26,11 @@ class AgyStatusBarWidgetFactory : StatusBarWidgetFactory {
     override fun getDisplayName(): String = AgyBundle.message("statusbar.metrics.displayName")
 
     /**
-     * 仅在插件配置启用状态栏指标展示时提供该控件。
+     * 仅在插件配置启用状态栏监控且已通过插件启动 Antigravity 终端会话时提供该控件。
      */
     override fun isAvailable(project: Project): Boolean =
-        AgySettingsState.getInstance().showStatusBarMetrics
+        AgySettingsState.getInstance().showStatusBarMetrics &&
+            project.getServiceIfCreated(AgyMetricsService::class.java)?.isSessionActive() == true
 
     /**
      * 创建与当前项目绑定的状态栏文本控件实例。

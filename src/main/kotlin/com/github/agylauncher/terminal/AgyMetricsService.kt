@@ -5,6 +5,7 @@ import com.google.gson.JsonParser
 import com.github.agylauncher.AgyBundle
 import com.github.agylauncher.settings.AgySettingsState
 import com.github.agylauncher.statusbar.AgyStatusBarWidget
+import com.github.agylauncher.statusbar.AgyStatusBarWidgetFactory
 import com.intellij.execution.configurations.GeneralCommandLine
 import com.intellij.execution.process.CapturingProcessHandler
 import com.intellij.openapi.Disposable
@@ -12,9 +13,11 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.util.SystemInfo
 import com.intellij.openapi.util.text.StringUtil
 import com.intellij.openapi.wm.WindowManager
+import com.intellij.openapi.wm.impl.status.widget.StatusBarWidgetsManager
 import com.intellij.util.concurrency.AppExecutorUtil
 import org.jetbrains.plugins.terminal.ShellTerminalWidget
 import java.io.File
@@ -49,6 +52,10 @@ class AgyMetricsService(private val project: Project) : Disposable {
     private val tooltipTextRef = AtomicReference(AgyBundle.message("statusbar.metrics.tooltipDefault"))
     private val pollingTaskRef = AtomicReference<ScheduledFuture<*>?>(null)
     private val started = AtomicBoolean(false)
+    /** 标记当前项目是否处于插件启动的活跃 Antigravity 终端会话中 */
+    private val sessionActive = AtomicBoolean(false)
+    /** 记录由插件启动或接管的 Antigravity 终端控件弱引用，用于监听标签页关闭 */
+    private val launchedWidgetRef = AtomicReference<WeakReference<ShellTerminalWidget>?>(null)
     /** 标记是否已发起后台拉取 agy 可用第三方模型列表的任务 */
     private val thirdPartyFetchStarted = AtomicBoolean(false)
     /** 从 `agy models` 动态解析出的第三方模型族展示名称（如 `CLAUDE&GPT`） */
@@ -106,6 +113,30 @@ class AgyMetricsService(private val project: Project) : Disposable {
     private val sessionKey: String = Integer.toHexString((project.basePath ?: project.name).hashCode())
     private val metricsOutputFile: File = File(System.getProperty("java.io.tmpdir"), "agy-launcher-metrics-$sessionKey.json")
     private val sessionSettingsFile: File = File(System.getProperty("java.io.tmpdir"), "agy-launcher-settings-$sessionKey.json")
+
+    /**
+     * 查询当前项目是否处于插件启动的活跃 Antigravity 终端会话中。
+     */
+    fun isSessionActive(): Boolean = sessionActive.get()
+
+    /**
+     * 标记插件已启动或聚焦 Antigravity 终端会话，挂载状态栏监控控件并在终端关闭时自动隐藏。
+     */
+    fun activateSession(widget: ShellTerminalWidget) {
+        if (project.isDisposed) return
+        val previousLaunched = launchedWidgetRef.get()?.get()
+        if (previousLaunched !== widget) {
+            if (!Disposer.tryRegister(widget) { deactivateSession(widget) }) {
+                return
+            }
+            launchedWidgetRef.set(WeakReference(widget))
+        }
+        cachedWidgetRef.set(WeakReference(widget))
+        val becameActive = sessionActive.compareAndSet(false, true)
+        if (becameActive) {
+            refreshStatusBarWidgetAvailability()
+        }
+    }
 
     /**
      * 确保后台 500ms 轮询任务已启动（幂等）。
@@ -258,11 +289,87 @@ class AgyMetricsService(private val project: Project) : Disposable {
      * 释放服务时取消后台定时轮询任务并清理缓存引用及临时配置文件。
      */
     override fun dispose() {
+        sessionActive.set(false)
+        started.set(false)
         pollingTaskRef.getAndSet(null)?.cancel(false)
+        launchedWidgetRef.set(null)
         cachedWidgetRef.set(null)
         listeners.clear()
         runCatching { metricsOutputFile.delete() }
         runCatching { sessionSettingsFile.delete() }
+    }
+
+    /**
+     * 停用当前状态栏会话并停止后台轮询，同时在目标终端已关闭时从状态栏隐藏监控控件。
+     */
+    private fun deactivateSession(closedWidget: ShellTerminalWidget?) {
+        if (closedWidget != null) {
+            val currentLaunched = launchedWidgetRef.get()?.get()
+            if (currentLaunched != null && currentLaunched !== closedWidget) return
+        }
+        sessionActive.set(false)
+        launchedWidgetRef.set(null)
+        cachedWidgetRef.set(null)
+        pollingTaskRef.getAndSet(null)?.cancel(false)
+        started.set(false)
+        resetSessionMetrics()
+        if (!project.isDisposed) {
+            refreshStatusBarWidgetAvailability()
+        }
+    }
+
+    /**
+     * 重置当前会话在内存与状态栏中的各项指标状态，避免下次重新启动时展示过期数据。
+     */
+    private fun resetSessionMetrics() {
+        synchronized(stateLock) {
+            clearContextMetrics()
+            tokPerSecText = null
+            fiveHourQuotaPercentValue = null
+            fiveHourQuotaPercentText = null
+            weeklyQuotaPercentValue = null
+            weeklyQuotaPercentText = null
+            quotaDetailText = null
+            lastQuotaBuckets = emptyList()
+            lastQuotaModelHint = null
+            previousLines = null
+            lastObservedWidget = null
+            awaitingContextDismiss = false
+            contextDismissDeadlineMs = 0L
+            contextSentAtMs = 0L
+            compactPendingRefresh = false
+            compactRefreshTriggerAtMs = 0L
+            pendingResumeRefresh = false
+            resumeStableSinceMs = 0L
+            lastResumeMarkerHash = 0
+            sawExternalModal = false
+            wasUsingAltBuffer = false
+            preModalBodyLines = emptyList()
+            lastMainPromptBodyLines = emptyList()
+            hasSeenMainPrompt = false
+            lastActiveMs = 0L
+            burstStartMs = 0L
+            suppressSpeedUntilMs = 0L
+            lastMetricsFileSignature = null
+            lastTotalOutputTokens = null
+            lastTotalApiDurationMs = null
+            resetPendingBurst()
+        }
+        displayTextRef.set(defaultDisplayText())
+        quotaTextRef.set(defaultQuotaText())
+        tooltipTextRef.set(AgyBundle.message("statusbar.metrics.tooltipDefault"))
+        runCatching { metricsOutputFile.delete() }
+    }
+
+    /**
+     * 在 EDT 上刷新当前项目的状态栏监控控件显隐状态。
+     */
+    private fun refreshStatusBarWidgetAvailability() {
+        ApplicationManager.getApplication().invokeLater({
+            if (project.isDisposed) return@invokeLater
+            project.getService(StatusBarWidgetsManager::class.java)
+                ?.updateWidget(AgyStatusBarWidgetFactory::class.java)
+        }, ModalityState.any())
     }
 
     /**
@@ -273,6 +380,9 @@ class AgyMetricsService(private val project: Project) : Disposable {
             if (project.isDisposed) return@invokeLater
             val widget = AgyTerminalService.getInstance(project).findAgyTerminalWidget()
             cachedWidgetRef.set(widget?.let { WeakReference(it) })
+            if (sessionActive.get() && widget == null) {
+                deactivateSession(launchedWidgetRef.get()?.get())
+            }
         }, ModalityState.any())
     }
 
@@ -1025,13 +1135,13 @@ class AgyMetricsService(private val project: Project) : Disposable {
         }
 
         /**
-         * 判断配额桶是否与当前活跃模型族匹配（Gemini 系列匹配 `gemini`，第三方模型匹配 `3p` 或显式前缀）。
+         * 判断配额桶是否与当前活跃模型族匹配（Gemini 及 Orchestrator 系列匹配 `gemini`，第三方模型匹配 `3p` 或显式前缀）。
          */
         private fun matchesActiveModel(bucketName: String, activeModelHint: String?): Boolean {
             if (activeModelHint.isNullOrBlank()) return false
             val lowerBucket = bucketName.lowercase(Locale.ROOT)
             val lowerModel = activeModelHint.lowercase(Locale.ROOT)
-            if (lowerModel.contains("gemini")) {
+            if (lowerModel.contains("gemini") || lowerModel.contains("orchestrator")) {
                 return lowerBucket.contains("gemini")
             }
             if (lowerBucket.startsWith("3p")) {
@@ -1053,7 +1163,11 @@ class AgyMetricsService(private val project: Project) : Disposable {
                 if (modelId.isEmpty()) continue
                 val lowerId = modelId.lowercase(Locale.ROOT)
                 val lowerDisplay = displayName.lowercase(Locale.ROOT)
-                if (lowerId.startsWith("gemini") || lowerDisplay.contains("gemini") || lowerId.contains("orchestrator")) {
+                if (lowerId.startsWith("gemini") ||
+                    lowerDisplay.contains("gemini") ||
+                    lowerId.contains("orchestrator") ||
+                    lowerDisplay.contains("orchestrator")
+                ) {
                     continue
                 }
                 val familyToken = modelId.substringBefore('-').trim()
